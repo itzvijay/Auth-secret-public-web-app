@@ -4,7 +4,13 @@ const express = require("express");
 const ejs = require("ejs");
 const bodyParser = require("body-parser");
 const mongoose = require("mongoose");
-const encrypt = require("mongoose-encryption");
+const session = require("express-session");
+const passport = require("passport");
+const passportLocalMongoose = require("passport-local-mongoose");
+const GoogleStrategy = require("passport-google-oauth20").Strategy; //strategy for the google authantication 
+const findOrCreate = require("mongoose-findorcreate"); //its for saving and finding and we are using for that to make our lives better
+
+
 
 const app = express();
 //console.log(process.env.API_KEY); its for the testing pourpose that works or not and we will ignore this file using .igignore to ignore this for security while uploading it to the real server...
@@ -12,6 +18,16 @@ const app = express();
 app.use(express.static("public"));
 app.set("view engine","ejs");
 app.use(bodyParser.urlencoded({extended:true}));
+
+app.use(session({ //initialize session and use that because we require it
+secret:"this is vijays secret",
+resave:false,
+saveUninitialized:false
+}));
+
+app.use(passport.initialize());  //initialize passport
+app.use(passport.session());  //for the passposrt dealing with the session
+
 
 //mongoose Connection to the database
 const connectionString = "mongodb://127.0.0.1:27017/userDB"; //userDB database Created
@@ -28,23 +44,54 @@ db.once("open",function(){
 
 const userSchema = new mongoose.Schema({
     email:String,
-    password:String
+    password:String,
+    googleId:String,  //using that we will no need to create a more users we just have the googleId for that 
+    secret:String
 });
 
-//mongoose encrption
-//Secret String Instead of Two Keys
-
-//const secret = "mysecretFilethatnoOneKnows"; //we added it in the .env file for security reson we can access it like process.env.secret thats all  //secret string instead of two keys
-
-userSchema.plugin(encrypt,{secret:process.env.SECRET,encryptedFields:["password"]});
-
-//here we all only encrypting the password we are adding plugins to the userSchema
-//in above that will plugin automatically and we dont wants to change the below code because the mongoose is very intelligent and can do it without changing
+userSchema.plugin(passportLocalMongoose); //adding plugin in our database
+userSchema.plugin(findOrCreate); //addding plugin for findORCreate into our database
 
 const User = mongoose.model("User",userSchema); // //user is the new collection
 
+passport.use(User.createStrategy());
+
+passport.serializeUser(function(user, done) {
+    done(null, user.id); //create the cockes
+  });
+  
+  passport.deserializeUser(function(id, done) {
+    User.findById(id, function(err, user) {
+      done(err, user);
+    });
+  }); //blast the cockies
+
+passport.use(new GoogleStrategy({
+    clientID: process.env.CLIENT_ID,
+    clientSecret: process.env.CLIENT_SECRET,
+    callbackURL: "http://localhost:3000/auth/google/secrets",
+    userProfileURL:" https://www.googleapis.com/oauth2/v3/userinfo"
+  },
+  function(accessToken, refreshToken, profile, cb) {
+    console.log(profile);
+    User.findOrCreate({ googleId: profile.id }, function (err, user) { //its save into our database and can find into our database
+      return cb(err, user);
+    });
+  }
+));
+
 app.get("/",function(req,res){
     res.render("home");
+});
+
+app.get("/auth/google",
+  passport.authenticate('google', { scope: ["profile"] }));
+
+app.get('/auth/google/secrets', 
+  passport.authenticate('google', { failureRedirect: '/login' }),
+  function(req, res) {
+    // Successful authentication, redirect home.
+    res.redirect('/secrets');
 });
 
 app.get("/login",function(req,res){
@@ -55,70 +102,88 @@ app.get("/register",function(req,res){
     res.render("register");
 });
 
-//post requests for the register and login
-//level 1 security
-
-app.post("/register",function(req,res){
-    const newUser = new User({
-        email:req.body.username,
-        password:req.body.password
-    });
-//saving the data in to the mongodb database
-    newUser.save(function(err){
+app.get("/secrets",function(req,res){ //here the cockeis password is elabled then we will render the page if note then it will go to the login page...
+    User.find({"secrets": {$ne:null}},function(err,foundUser){ //were find secrets not should be null then found the user 
         if(err){
             console.log(err);
         }else{
-            res.render("secrets");
+            if(foundUser){
+                res.render("secrets",{userWithSecrets:foundUser}); //give the all all our secrets value to the userWithSecrets
+            }
+        }
+    });
+});
+
+
+app.get("/submit",function(req,res){
+    if(req.isAuthenticated){
+        res.render("submit");
+    }else{
+        res.redirect("/login");
+    }
+})
+
+app.post("/submit",function(req,res){
+    const SubmittedSecret = req.body.secret;
+
+    console.log(req.user);
+    User.findById(req.user.id,function(err,foundUser){
+        if(err){
+            console.log(err);
+        }else{
+            if(foundUser){
+                foundUser.secret = SubmittedSecret;
+                foundUser.save(function(){
+                    res.redirect("/secrets");
+                });
+            }
+        }
+    });
+});
+
+app.get("/logout",function(req,res){
+    req.logout(function(err){
+        if(err){
+            console.log(err);
+        }
+    });
+    res.redirect("/");
+});
+
+//post requests for the register and login
+//level 1 security
+
+app.post("/register",function(req,res){ //below the all in the database doing by passposrt-local-mongoose so we write it as given in the npm documentation
+
+    User.register({username:req.body.username},req.body.password,function(err,user){
+        if(err){
+            console.log(err);
+            res.redirect("/register");
+        }else{
+            passport.authenticate("local")(req,res,function(){
+                res.redirect("/secrets");
+            });
         }
     });
 });
 
 app.post("/login",function(req,res){
-//first we need to get what user types and save it
+    const user = new User({
+        username:req.body.username,
+        password:req.body.password
+    });
 
-    const username = req.body.username;
-    const password = req.body.password;
-
-//after that we wants to find the data entered by the user exist in our database or not
-
-    User.findOne({email:username},function(err,found){
+    req.login(user,function(err){
         if(err){
             console.log(err);
         }else{
-            if(password === found.password){
-                res.render("secrets");
-            }
+            passport.authenticate("local")(req,res,function(){
+                res.redirect("/secrets");
+            });
         }
-    });  ///or we can do as angela done the code is below
+    });
+});
 
-/*pp.post("/login",function(req,res){
-//first we need to get what user types and save it
-
-    const username = req.body.username;
-    const password = req.body.password;
-
-    //after that we wants to find the data entered by the user exist in our database or not
-
-    User.findOne({email:username},function(err,found){
-        if(err){
-            console.log(err);
-        }else{
-            if(found){
-                if(password === found.password){
-                    res.render("secrets");
-                }
-            }
-        }
-    }); */
-
-//Level 2 security
-
-/*A .env file is a plain text file used to store environment variables for a software application. These variables can include things like database credentials, API keys, or other sensitive information that should not be hard-coded into the application's source code. The .env file is typically located in the root directory of the application and is not committed to version control, so that this sensitive information is kept private. */
-
-//so that we are install that npm package and we will require it in our app
-
-
-})
 app.listen(3000,function(){
     console.log("the server is listening on port 3000");
 });
